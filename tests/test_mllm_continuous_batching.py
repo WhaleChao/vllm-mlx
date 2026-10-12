@@ -2559,3 +2559,117 @@ class TestPromptBoundaryKeying:
 
         assert lookups == [self.BODY]
         assert stores == [(self.BODY, len(ids) - self.BOUNDARY, "interleaved prefill")]
+
+    def _chunked_rotating_prefill(self, max_kv_size, think_suffix_len):
+        from vllm_mlx.memory_cache import MemoryAwarePrefixCache, MemoryCacheConfig
+        from vllm_mlx.mllm_batch_generator import (
+            MLLMBatchRequest,
+            install_chunked_prefill_mllm,
+        )
+
+        prefilled = []
+
+        class LanguageModel:
+            layers = [object()]
+
+            def __call__(self, inputs, cache=None):
+                tokens = inputs.reshape(-1).tolist()
+                prefilled.extend(tokens)
+                count = inputs.shape[1]
+                keys = mx.broadcast_to(inputs[:, None, :, None], (1, 1, count, 4))
+                cache[0].update_and_fetch(keys.astype(mx.float32), mx.zeros_like(keys))
+                return mx.zeros((1, count, 64))
+
+        gen = self._gen()
+        gen._think_suffix_len = think_suffix_len
+        gen.max_kv_size = max_kv_size
+        del gen._has_empty_rotating_cache
+        gen.language_model = LanguageModel()
+        gen.prefix_cache = MemoryAwarePrefixCache(
+            gen.language_model, MemoryCacheConfig(max_memory_mb=64)
+        )
+        gen.sampler = lambda _: mx.array([1], dtype=mx.uint32)
+        # The regression concerns prefill reuse, so keep decode out of the
+        # recorded language-model inputs without replacing the cache store.
+        gen._step = lambda *args: (
+            mx.array([1], dtype=mx.uint32),
+            mx.zeros((1, 64)),
+        )
+        gen._preprocess_request = lambda _: None
+        gen._next = lambda: []
+        install_chunked_prefill_mllm(gen, budget=8)
+
+        def _prefill(ids, uid):
+            # The first request has finished; isolate prefill from decoding.
+            gen.active_batch = None
+            req = MLLMBatchRequest(uid=uid, request_id=f"turn-{uid}", prompt="x")
+            req.input_ids = mx.array([ids])
+            req.is_text_only = True
+            gen.unprocessed_requests.append(req)
+            for _ in range(32):
+                gen._next()
+                if gen._partial is None and gen.active_batch is not None:
+                    return
+            pytest.fail("Interleaved prefill did not complete")
+
+        return gen, prefilled, _prefill
+
+    def test_chunked_prefill_reuses_saturated_cache_without_thinking_suffix(self):
+        gen, prefilled, _prefill = self._chunked_rotating_prefill(64, 0)
+        # Above both the rotating window and the production cache minimum.
+        turn1 = [1] * 144 + [
+            self.IM_END,
+            self.NL,
+            self.IM_START,
+            self.ASSISTANT,
+            self.NL,
+        ]
+        continuation = [
+            20,
+            21,
+            self.IM_END,
+            self.NL,
+            self.IM_START,
+            30,
+            self.NL,
+            31,
+            self.IM_END,
+            self.NL,
+            self.IM_START,
+            self.ASSISTANT,
+            self.NL,
+        ]
+        turn2 = turn1 + continuation
+        _prefill(turn1, 1)
+        assert prefilled == turn1
+
+        cached, remaining = gen.prefix_cache.fetch(turn2)
+        assert cached is not None, "The completed prompt must remain reusable"
+        assert cached[0].offset == 149
+        assert not cached[0].is_trimmable()
+        assert remaining == continuation
+
+        prefilled.clear()
+        _prefill(turn2, 2)
+        assert prefilled == continuation
+
+    def test_chunked_thinking_off_prefill_preserves_earlier_reusable_prefix(self):
+        gen, _, _prefill = self._chunked_rotating_prefill(256, 2)
+        body = [1] * 144 + [self.IM_END]
+        _prefill(body + self.SUFFIX_OFF, 1)
+
+        # The first boundary snapshot fits in the window. A longer next turn
+        # wraps, so its boundary cannot be recovered after prefill.
+        next_body = body + [self.IM_START, self.ASSISTANT] + [20] * 150
+        next_body += [self.IM_END, self.IM_START, 30, 31, self.IM_END]
+        _prefill(next_body + self.SUFFIX_OFF, 2)
+
+        # History replaces the empty thought suffix with an actual reply. The
+        # older boundary must survive rather than be evicted by a full-prompt
+        # entry that includes that incompatible generation suffix.
+        later = next_body + [self.IM_START, self.ASSISTANT, 21, self.IM_END]
+        later += [self.IM_START, 30, 31, self.IM_END] + self.SUFFIX_OFF
+        cached, remaining = gen.prefix_cache.fetch(later)
+        assert cached is not None, "The earlier reusable prefix must survive"
+        assert cached[0].offset == 145
+        assert remaining == later[145:]

@@ -3245,13 +3245,28 @@ def install_chunked_prefill_mllm(
                         # trim is just the generation prompt — the same boundary
                         # the canonical path uses.
                         trim_amount = len(input_ids_list) - boundary
-                        batch_gen._store_prefix_snapshot(
+                        stored = batch_gen._store_prefix_snapshot(
                             cache_key,
                             partial["cache"],
                             trim_amount,
                             req.request_id,
                             "interleaved prefill",
                         )
+                        if (
+                            not stored
+                            and trim_amount > 0
+                            and batch_gen._think_suffix_len == 0
+                        ):
+                            # Templates without a thinking suffix previously
+                            # stored zero-trim full prompts. Preserve those
+                            # checkpoints when the boundary cannot be rewound.
+                            batch_gen._store_prefix_snapshot(
+                                input_ids_list,
+                                partial["cache"],
+                                0,
+                                req.request_id,
+                                "interleaved full-prompt prefill",
+                            )
                     except Exception as e:
                         logger.warning(
                             f"Failed to store prefix cache after chunked "
